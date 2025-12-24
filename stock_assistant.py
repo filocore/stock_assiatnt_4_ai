@@ -1238,10 +1238,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--daily-len", type=int, default=320, help="日K长度，默认 320")
     parser.add_argument("--bench", type=str, default="sh000001", help="基准指数代码，默认 sh000001")
     parser.add_argument("--client", action="store_true", help="启动Python客户端（交互/历史/复制）")
+    parser.add_argument("--gui", action="store_true", help="启动图形化界面")
     parser.add_argument("--history-file", type=str, default="history.jsonl", help="历史数据文件，默认 history.jsonl")
     args = parser.parse_args(argv)
 
     codes = _parse_codes_from_input(args.codes) if args.codes else []
+
+    if args.gui:
+        return gui(
+            codes=codes,
+            interval_s=max(args.interval, 0.5),
+            timeout_s=args.timeout,
+            daily=bool(args.daily),
+            daily_len=max(int(args.daily_len), 1),
+            bench=str(args.bench).strip(),
+            history_file=str(args.history_file).strip() or "history.jsonl",
+        )
+
     if not codes and not args.client:
         try:
             text = input("请输入股票代码（逗号分隔，例如 600000,000001）：").strip()
@@ -1767,20 +1780,14 @@ def gui(
 ) -> int:
     try:
         import tkinter as tk
-        from tkinter import ttk
-    except Exception:
-        return gui_qt(
-            codes=codes,
-            interval_s=interval_s,
-            timeout_s=timeout_s,
-            daily=daily,
-            daily_len=daily_len,
-            bench=bench,
-            history_file=history_file,
-        )
+        from tkinter import ttk, messagebox
+    except ImportError:
+        print("Error: tkinter is required for GUI mode.")
+        return 1
 
     history_path = os.path.abspath(history_file)
     _ensure_dir(history_path)
+    watchlist_file = os.path.join(os.path.dirname(history_path), "watchlist.json")
 
     records: List[Dict[str, object]] = _load_jsonl_records(history_path)
     intraday_state: Dict[str, Deque[Tuple[float, float]]] = {}
@@ -1788,397 +1795,49 @@ def gui(
     bench_candles = fetch_tencent_daily_candles(bench, count=daily_len) if daily and bench else []
     lock = threading.Lock()
 
-    def append_record(rec: Dict[str, object]) -> None:
-        with lock:
-            records.append(rec)
-            _append_jsonl_record(history_path, rec)
-
-    def fetch_and_store(codes_text: str, status_cb: Optional[object] = None) -> List[str]:
-        raw_codes = _parse_codes_from_input(codes_text)
-        symbols = [normalize_symbol(c) for c in raw_codes]
-        symbols = [s for s in symbols if s]
-        if not symbols:
-            raise ValueError("请输入至少一个有效股票代码")
-
-        if callable(status_cb):
-            status_cb(f"拉取行情... symbols={len(symbols)}")
-        quotes = fetch_sina_quotes(symbols, timeout_s=timeout_s)
-        ts = time.time()
-        req_date, req_time = _request_date_time(ts)
-        out_syms: List[str] = []
-        for i, sym in enumerate(symbols, start=1):
-            q = quotes.get(sym)
-            if not q:
-                continue
-
-            if callable(status_cb):
-                status_cb(f"处理 {i}/{len(symbols)}: {sym}")
-            
-            if callable(status_cb):
-                status_cb(f"拉取5分钟K线: {sym}")
-            m5_candles = fetch_kline_data(sym, scale="m5", count=200, timeout_s=timeout_s)
-
-            state = intraday_state.setdefault(sym, deque(maxlen=240))
-            if not state and m5_candles:
-                for c in m5_candles:
-                    try:
-                        dt = datetime.strptime(c.date, "%Y-%m-%d %H:%M:%S")
-                        state.append((dt.timestamp(), c.close_price))
-                    except Exception:
-                        pass
-
-            state.append((ts, q.price))
-            interval = ts - last_ts.get(sym, ts - 1.0)
-            if interval <= 0:
-                interval = 1.0
-            last_ts[sym] = ts
-
-            intraday_metrics = analyze_quote(q, state, interval_s=interval)
-            
-            # m5_candles fetched above
-            m5_metrics = analyze_daily_candles(m5_candles, None) if m5_candles else {}
-            m5_bars_today = [_candle_to_dict(c) for c in _filter_m5_from_0930(m5_candles, q.date)]
-
-            if callable(status_cb):
-                status_cb(f"拉取1分钟K线: {sym}")
-            m1_candles = fetch_kline_data(sym, scale="m1", count=400, timeout_s=timeout_s)
-            auction_bars_c = _filter_window(m1_candles, q.date, "09:15", "09:30")
-            auction_bars = [_candle_to_dict(c) for c in auction_bars_c]
-            auction_summary = _auction_summary(auction_bars_c)
-            if _is_auction_time(q.date, q.time):
-                append_record(
-                    {
-                        "kind": "auction_sample",
-                        "ts": ts,
-                        "date": req_date,
-                        "time": req_time,
-                        "quote_date": q.date,
-                        "quote_time": q.time,
-                        "symbol": q.symbol,
-                        "name": q.name,
-                        "price": q.price,
-                        "volume": q.volume,
-                        "amount": q.amount,
-                        "bid_prices": list(q.bid_prices),
-                        "bid_volumes": list(q.bid_volumes),
-                        "ask_prices": list(q.ask_prices),
-                        "ask_volumes": list(q.ask_volumes),
-                    }
-                )
-
-            daily_metrics = {}
-            if daily:
-                if callable(status_cb):
-                    status_cb(f"拉取日K: {sym}")
-                d_candles = fetch_tencent_daily_candles(sym, count=daily_len)
-                daily_metrics = analyze_daily_candles(d_candles, bench_candles)
-
-            rec = {
-                "kind": "snapshot",
-                "ts": ts,
-                "date": req_date,
-                "time": req_time,
-                "quote_date": q.date,
-                "quote_time": q.time,
-                "symbol": q.symbol,
-                "name": q.name,
-                "price": q.price,
-                "prev_close": q.prev_close,
-                "open": q.open_price,
-                "high": q.high,
-                "low": q.low,
-                "volume": q.volume,
-                "amount": q.amount,
-                "orderbook": _orderbook_to_dict(q),
-                "intraday_metrics": intraday_metrics,
-                "m5_metrics": m5_metrics,
-                "m5_bars_today": m5_bars_today,
-                "auction_summary": auction_summary,
-                "auction_bars": auction_bars,
-                "daily_metrics": daily_metrics,
-            }
-            append_record(rec)
-            out_syms.append(q.symbol)
-        return out_syms
-
-    def grouped_symbols(filter_text: str) -> List[str]:
-        f = normalize_symbol(filter_text) if filter_text else ""
-        syms = sorted({str(r.get("symbol", "")).lower() for r in records if r.get("symbol")})
-        if not f:
-            return syms
-        return [s for s in syms if s == f]
-
-    def records_for_symbol(sym: str) -> List[Dict[str, object]]:
-        s = normalize_symbol(sym) if sym else ""
-        if not s:
-            return []
-        return [r for r in records if str(r.get("symbol", "")).lower() == s]
-
-    def latest_snapshot(sym: str) -> Optional[Dict[str, object]]:
-        for r in reversed(records_for_symbol(sym)):
-            kind = str(r.get("kind") or "snapshot").lower()
-            if kind != "auction_sample":
-                return r
-        return None
-
-    root = tk.Tk()
-    root.title("股票助手（桌面端）")
-    root.geometry("1100x700")
-
-    top = ttk.Frame(root, padding=10)
-    top.pack(fill="x")
-
-    codes_var = tk.StringVar(value=",".join(codes) if codes else "")
-    filter_var = tk.StringVar(value="")
-    auto_var = tk.BooleanVar(value=False)
-    status_var = tk.StringVar(value="")
-
-    ttk.Label(top, text="股票代码").pack(side="left")
-    codes_entry = ttk.Entry(top, textvariable=codes_var, width=40)
-    codes_entry.pack(side="left", padx=(6, 10))
-
-    fetch_btn = ttk.Button(top, text="获取/刷新")
-    fetch_btn.pack(side="left")
-
-    ttk.Label(top, text="过滤").pack(side="left", padx=(12, 0))
-    filter_entry = ttk.Entry(top, textvariable=filter_var, width=16)
-    filter_entry.pack(side="left", padx=(6, 10))
-
-    reload_btn = ttk.Button(top, text="重载历史")
-    reload_btn.pack(side="left")
-
-    ttk.Checkbutton(top, text="自动刷新", variable=auto_var).pack(side="left", padx=(12, 0))
-
-    main = ttk.Panedwindow(root, orient="horizontal")
-    main.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-    left = ttk.Frame(main, padding=8)
-    mid = ttk.Frame(main, padding=8)
-    right = ttk.Frame(main, padding=8)
-    main.add(left, weight=1)
-    main.add(mid, weight=2)
-    main.add(right, weight=3)
-
-    ttk.Label(left, text="股票列表").pack(anchor="w")
-    sym_list = tk.Listbox(left, height=25)
-    sym_list.pack(fill="both", expand=True, pady=(6, 0))
-
-    ttk.Label(mid, text="快照列表").pack(anchor="w")
-    snap_list = tk.Listbox(mid, height=25)
-    snap_list.pack(fill="both", expand=True, pady=(6, 0))
-
-    btn_row = ttk.Frame(mid)
-    btn_row.pack(fill="x", pady=(10, 0))
-    copy_latest_btn = ttk.Button(btn_row, text="复制最新")
-    copy_latest_btn.pack(side="left")
-    copy_history_btn = ttk.Button(btn_row, text="复制历史")
-    copy_history_btn.pack(side="left", padx=(10, 0))
-
-    info_label = ttk.Label(right, text="详情")
-    info_label.pack(anchor="w")
-    text = tk.Text(right, wrap="none")
-    text.pack(fill="both", expand=True, pady=(6, 0))
-
-    status = ttk.Label(root, textvariable=status_var, padding=(10, 4))
-    status.pack(fill="x")
-
-    def set_status(msg: str) -> None:
-        status_var.set(msg)
-
-    def safe_json(obj: object) -> str:
-        return json.dumps(_json_safe(obj), ensure_ascii=False, indent=2, sort_keys=True)
-
-    def refresh_symbol_list() -> None:
-        sym_list.delete(0, "end")
-        for s in grouped_symbols(filter_var.get()):
-            sym_list.insert("end", s)
-
-    def refresh_snap_list(sym: str) -> None:
-        snap_list.delete(0, "end")
-        rs = records_for_symbol(sym)
-        snaps = [r for r in rs if str(r.get("kind") or "snapshot").lower() != "auction_sample"]
-        for r in snaps[-200:]:
-            t = _format_record_dt(r)
-            p = r.get("price")
-            snap_list.insert("end", f"{t}  price={p}")
-
-    def show_details_for_snapshot(sym: str, snap_index: int) -> None:
-        rs = records_for_symbol(sym)
-        snaps = [r for r in rs if str(r.get("kind") or "snapshot").lower() != "auction_sample"]
-        if not snaps:
-            text.delete("1.0", "end")
-            return
-        idx = max(len(snaps) - 200 + snap_index, 0)
-        if idx < 0 or idx >= len(snaps):
-            idx = len(snaps) - 1
-        r = snaps[idx]
-        auc = [x for x in rs if str(x.get("kind") or "").lower() == "auction_sample"]
-        head = {
-            "symbol": sym,
-            "snapshots": len(snaps),
-            "auction_samples": len(auc),
-        }
-        body = safe_json({"meta": head, "snapshot": r})
-        text.delete("1.0", "end")
-        text.insert("1.0", body)
-
-    def selected_symbol() -> str:
-        sel = sym_list.curselection()
-        if not sel:
-            return ""
-        v = sym_list.get(sel[0])
-        return str(v)
-
-    def on_symbol_select(event: object) -> None:
-        sym = selected_symbol()
-        if not sym:
-            return
-        if not codes_var.get().strip():
-            codes_var.set(sym)
-        refresh_snap_list(sym)
-        show_details_for_snapshot(sym, snap_list.size() - 1)
-
-    def on_snap_select(event: object) -> None:
-        sym = selected_symbol()
-        if not sym:
-            return
-        sel = snap_list.curselection()
-        if not sel:
-            return
-        show_details_for_snapshot(sym, int(sel[0]))
-
-    def reload_history() -> None:
-        nonlocal records
-        with lock:
-            records = _load_jsonl_records(history_path)
-        refresh_symbol_list()
-        set_status(f"已重载历史 records={len(records)}")
-
-    def do_fetch() -> None:
-        codes_text = codes_var.get().strip()
-        if not codes_text:
-            set_status("请输入股票代码")
-            return
-
-        def worker() -> None:
+    def load_watchlist() -> List[str]:
+        if os.path.exists(watchlist_file):
             try:
-                got = fetch_and_store(codes_text)
-                root.after(0, lambda: after_fetch(got))
-            except Exception as e:
-                root.after(0, lambda: set_status(str(e)))
+                with open(watchlist_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return [str(x) for x in data]
+            except Exception:
+                pass
+        return []
 
-        def after_fetch(got: List[str]) -> None:
-            refresh_symbol_list()
-            set_status(f"已获取: {', '.join(got) if got else '无'}  records={len(records)}")
-
-        threading.Thread(target=worker, daemon=True).start()
-        set_status("请求中...")
-
-    def copy_text_to_clipboard(payload: str) -> None:
-        if not payload:
-            return
-        root.clipboard_clear()
-        root.clipboard_append(payload)
-        root.update()
-        set_status("已复制到剪贴板")
-
-    def on_copy_latest() -> None:
-        sym = selected_symbol()
-        if not sym:
-            set_status("请选择股票")
-            return
-        r = latest_snapshot(sym)
-        if not r:
-            set_status("无可复制数据")
-            return
-        copy_text_to_clipboard(safe_json(r))
-
-    def on_copy_history() -> None:
-        sym = selected_symbol()
-        if not sym:
-            set_status("请选择股票")
-            return
-        rs = records_for_symbol(sym)
-        if not rs:
-            set_status("无可复制数据")
-            return
-        copy_text_to_clipboard(safe_json(rs))
-
-    def schedule_auto() -> None:
-        if auto_var.get():
-            do_fetch()
-        root.after(int(max(interval_s, 0.5) * 1000), schedule_auto)
-
-    fetch_btn.configure(command=do_fetch)
-    reload_btn.configure(command=reload_history)
-    copy_latest_btn.configure(command=on_copy_latest)
-    copy_history_btn.configure(command=on_copy_history)
-    sym_list.bind("<<ListboxSelect>>", on_symbol_select)
-    snap_list.bind("<<ListboxSelect>>", on_snap_select)
-    filter_entry.bind("<KeyRelease>", lambda e: refresh_symbol_list())
-
-    refresh_symbol_list()
-    if codes_var.get().strip():
-        do_fetch()
-    schedule_auto()
-
-    root.mainloop()
-    return 0
-
-
-def gui_qt(
-    codes: Sequence[str],
-    interval_s: float,
-    timeout_s: float,
-    daily: bool,
-    daily_len: int,
-    bench: str,
-    history_file: str,
-) -> int:
-    try:
-        from PySide6 import QtCore, QtWidgets
-    except Exception as e:
-        raise RuntimeError(
-            "当前Python缺少Tk(_tkinter)，且未安装PySide6。请创建虚拟环境后执行：pip install PySide6"
-        ) from e
-
-    history_path = os.path.abspath(history_file)
-    _ensure_dir(history_path)
-
-    records: List[Dict[str, object]] = _load_jsonl_records(history_path)
-    intraday_state: Dict[str, Deque[Tuple[float, float]]] = {}
-    last_ts: Dict[str, float] = {}
-    bench_candles = fetch_tencent_daily_candles(bench, count=daily_len) if daily and bench else []
-    lock = threading.Lock()
+    def save_watchlist(items: List[str]) -> None:
+        try:
+            with open(watchlist_file, "w", encoding="utf-8") as f:
+                json.dump(items, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def append_record(rec: Dict[str, object]) -> None:
         with lock:
             records.append(rec)
             _append_jsonl_record(history_path, rec)
 
-    def fetch_and_store(codes_text: str, status_cb: Optional[object] = None) -> List[str]:
-        raw_codes = _parse_codes_from_input(codes_text)
-        symbols = [normalize_symbol(c) for c in raw_codes]
-        symbols = [s for s in symbols if s]
-        if not symbols:
-            raise ValueError("请输入至少一个有效股票代码")
-
+    def fetch_and_store(target_syms: List[str], status_cb: Optional[object] = None) -> List[str]:
+        if not target_syms:
+             return []
+        
         if callable(status_cb):
-            status_cb(f"拉取行情... symbols={len(symbols)}")
-        quotes = fetch_sina_quotes(symbols, timeout_s=timeout_s)
+            status_cb(f"拉取行情... symbols={len(target_syms)}")
+            
+        quotes = fetch_sina_quotes(target_syms, timeout_s=timeout_s)
         ts = time.time()
         req_date, req_time = _request_date_time(ts)
         out_syms: List[str] = []
-        for i, sym in enumerate(symbols, start=1):
+        
+        for i, sym in enumerate(target_syms, start=1):
             q = quotes.get(sym)
             if not q:
                 continue
 
             if callable(status_cb):
-                status_cb(f"处理 {i}/{len(symbols)}: {sym}")
+                status_cb(f"处理 {i}/{len(target_syms)}: {sym}")
             
-            if callable(status_cb):
-                status_cb(f"拉取5分钟K线: {sym}")
             m5_candles = fetch_kline_data(sym, scale="m5", count=200, timeout_s=timeout_s)
 
             state = intraday_state.setdefault(sym, deque(maxlen=240))
@@ -2197,37 +1856,32 @@ def gui_qt(
             last_ts[sym] = ts
 
             intraday_metrics = analyze_quote(q, state, interval_s=interval)
-            
-            # m5_candles fetched above
             m5_metrics = analyze_daily_candles(m5_candles, None) if m5_candles else {}
             m5_bars_today = [_candle_to_dict(c) for c in _filter_m5_from_0930(m5_candles, q.date)]
 
-            if callable(status_cb):
-                status_cb(f"拉取1分钟K线: {sym}")
             m1_candles = fetch_kline_data(sym, scale="m1", count=400, timeout_s=timeout_s)
             auction_bars_c = _filter_window(m1_candles, q.date, "09:15", "09:30")
             auction_bars = [_candle_to_dict(c) for c in auction_bars_c]
             auction_summary = _auction_summary(auction_bars_c)
+            
             if _is_auction_time(q.date, q.time):
-                append_record(
-                    {
-                        "kind": "auction_sample",
-                        "ts": ts,
-                        "date": req_date,
-                        "time": req_time,
-                        "quote_date": q.date,
-                        "quote_time": q.time,
-                        "symbol": q.symbol,
-                        "name": q.name,
-                        "price": q.price,
-                        "volume": q.volume,
-                        "amount": q.amount,
-                        "bid_prices": list(q.bid_prices),
-                        "bid_volumes": list(q.bid_volumes),
-                        "ask_prices": list(q.ask_prices),
-                        "ask_volumes": list(q.ask_volumes),
-                    }
-                )
+                append_record({
+                    "kind": "auction_sample",
+                    "ts": ts,
+                    "date": req_date,
+                    "time": req_time,
+                    "quote_date": q.date,
+                    "quote_time": q.time,
+                    "symbol": q.symbol,
+                    "name": q.name,
+                    "price": q.price,
+                    "volume": q.volume,
+                    "amount": q.amount,
+                    "bid_prices": list(q.bid_prices),
+                    "bid_volumes": list(q.bid_volumes),
+                    "ask_prices": list(q.ask_prices),
+                    "ask_volumes": list(q.ask_volumes),
+                })
 
             daily_metrics = {}
             if daily:
@@ -2262,15 +1916,19 @@ def gui_qt(
             }
             append_record(rec)
             out_syms.append(q.symbol)
+            
         return out_syms
 
-    def symbols_filtered(filter_text: str) -> List[str]:
-        f = normalize_symbol(filter_text) if filter_text else ""
-        with lock:
-            syms = sorted({str(r.get("symbol", "")).lower() for r in records if r.get("symbol")})
-        if not f:
-            return syms
-        return [s for s in syms if s == f]
+    # Initialize watchlist
+    watch_codes = load_watchlist()
+    if codes:
+        existing = set(normalize_symbol(c) for c in watch_codes)
+        for c in codes:
+            norm = normalize_symbol(c)
+            if norm and norm not in existing:
+                watch_codes.append(c)
+                existing.add(norm)
+        save_watchlist(watch_codes)
 
     def records_for_symbol(sym: str) -> List[Dict[str, object]]:
         s = normalize_symbol(sym) if sym else ""
@@ -2286,219 +1944,286 @@ def gui_qt(
                 return r
         return None
 
-    def safe_json(obj: object) -> str:
-        return json.dumps(_json_safe(obj), ensure_ascii=False, indent=2, sort_keys=True)
+    # GUI Setup
+    root = tk.Tk()
+    root.title("股票助手")
+    root.geometry("1100x700")
 
-    app = QtWidgets.QApplication([])
-    win = QtWidgets.QMainWindow()
-    win.setWindowTitle("股票助手（桌面端）")
+    add_code_var = tk.StringVar()
+    auto_refresh_var = tk.BooleanVar(value=False)
+    status_var = tk.StringVar()
+    
+    main_paned = ttk.PanedWindow(root, orient="horizontal")
+    main_paned.pack(fill="both", expand=True, padx=5, pady=5)
 
-    central = QtWidgets.QWidget()
-    win.setCentralWidget(central)
-    root = QtWidgets.QVBoxLayout(central)
+    left_frame = ttk.Frame(main_paned, width=250)
+    right_frame = ttk.Frame(main_paned)
+    main_paned.add(left_frame, weight=1)
+    main_paned.add(right_frame, weight=3)
 
-    top = QtWidgets.QHBoxLayout()
-    root.addLayout(top)
-
-    top.addWidget(QtWidgets.QLabel("股票代码"))
-    codes_edit = QtWidgets.QLineEdit(",".join(codes) if codes else "")
-    codes_edit.setMinimumWidth(360)
-    top.addWidget(codes_edit)
-
-    fetch_btn = QtWidgets.QPushButton("获取/刷新")
-    top.addWidget(fetch_btn)
-
-    top.addSpacing(12)
-    top.addWidget(QtWidgets.QLabel("过滤"))
-    filter_edit = QtWidgets.QLineEdit("")
-    filter_edit.setMaximumWidth(200)
-    top.addWidget(filter_edit)
-
-    reload_btn = QtWidgets.QPushButton("重载历史")
-    top.addWidget(reload_btn)
-
-    top.addSpacing(12)
-    auto_chk = QtWidgets.QCheckBox("自动刷新")
-    top.addWidget(auto_chk)
-    top.addStretch(1)
-
-    splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-    root.addWidget(splitter, 1)
-
-    sym_list = QtWidgets.QListWidget()
-    snap_list = QtWidgets.QListWidget()
-    detail = QtWidgets.QPlainTextEdit()
-    detail.setReadOnly(True)
-    splitter.addWidget(sym_list)
-    splitter.addWidget(snap_list)
-    splitter.addWidget(detail)
-    splitter.setStretchFactor(0, 1)
-    splitter.setStretchFactor(1, 2)
-    splitter.setStretchFactor(2, 4)
-
-    btn_row = QtWidgets.QHBoxLayout()
-    root.addLayout(btn_row)
-    copy_latest_btn = QtWidgets.QPushButton("复制最新")
-    copy_history_btn = QtWidgets.QPushButton("复制历史")
-    btn_row.addWidget(copy_latest_btn)
-    btn_row.addWidget(copy_history_btn)
-    btn_row.addStretch(1)
-
-    status = QtWidgets.QLabel("")
-    root.addWidget(status)
-
-    def set_status(msg: str) -> None:
-        status.setText(msg)
-
-    def refresh_symbol_list() -> None:
-        sym_list.clear()
-        for s in symbols_filtered(filter_edit.text()):
-            sym_list.addItem(s)
-
-    def current_symbol() -> str:
-        item = sym_list.currentItem()
-        return item.text() if item else ""
-
-    def refresh_snapshots(sym: str) -> None:
-        snap_list.clear()
-        rs = records_for_symbol(sym)
-        snaps = [r for r in rs if str(r.get("kind") or "snapshot").lower() != "auction_sample"]
-        for r in snaps[-200:]:
-            t = _format_record_dt(r)
-            p = r.get("price")
-            snap_list.addItem(f"{t}  price={p}")
-
-    def show_snapshot(sym: str, row: int) -> None:
-        rs = records_for_symbol(sym)
-        snaps = [r for r in rs if str(r.get("kind") or "snapshot").lower() != "auction_sample"]
-        if not snaps:
-            detail.setPlainText("")
-            return
-        idx = max(len(snaps) - 200 + row, 0)
-        if idx < 0 or idx >= len(snaps):
-            idx = len(snaps) - 1
-        r = snaps[idx]
-        auc = [x for x in rs if str(x.get("kind") or "").lower() == "auction_sample"]
-        payload = {"meta": {"symbol": sym, "snapshots": len(snaps), "auction_samples": len(auc)}, "snapshot": r}
-        detail.setPlainText(safe_json(payload))
-
-    def on_symbol_changed() -> None:
-        sym = current_symbol()
+    # Watchlist UI
+    ttk.Label(left_frame, text="股票列表").pack(fill="x", pady=5)
+    input_frame = ttk.Frame(left_frame)
+    input_frame.pack(fill="x", pady=2)
+    ttk.Entry(input_frame, textvariable=add_code_var).pack(side="left", fill="x", expand=True)
+    
+    def add_code():
+        raw = add_code_var.get().strip()
+        if not raw: return
+        sym = normalize_symbol(raw)
         if not sym:
+            messagebox.showerror("错误", "无效的股票代码")
             return
-        if not codes_edit.text().strip():
-            codes_edit.setText(sym)
-        refresh_snapshots(sym)
-        if snap_list.count() > 0:
-            snap_list.setCurrentRow(snap_list.count() - 1)
-            show_snapshot(sym, snap_list.currentRow())
+        
+        current_items = list(watchlist.get(0, "end"))
+        current_syms = [normalize_symbol(x.split(" ")[0]) for x in current_items]
+        
+        if sym in current_syms:
+             messagebox.showinfo("提示", "该股票已在列表中")
+             add_code_var.set("")
+             return
 
-    def on_snapshot_changed() -> None:
-        sym = current_symbol()
-        if not sym:
+        watchlist.insert("end", raw)
+        save_current_watchlist()
+        add_code_var.set("")
+        fetch_data([sym])
+
+    ttk.Button(input_frame, text="+", width=3, command=add_code).pack(side="left", padx=2)
+
+    watchlist = tk.Listbox(left_frame)
+    watchlist.pack(fill="both", expand=True, pady=5)
+    
+    def delete_code():
+        sel = watchlist.curselection()
+        if not sel: return
+        watchlist.delete(sel[0])
+        save_current_watchlist()
+
+    ttk.Button(left_frame, text="删除选中", command=delete_code).pack(fill="x", pady=2)
+
+    # Details UI
+    top_bar = ttk.Frame(right_frame)
+    top_bar.pack(fill="x", pady=5)
+    
+    ttk.Button(top_bar, text="立即刷新", command=lambda: fetch_all(force=True)).pack(side="left", padx=5)
+    ttk.Checkbutton(top_bar, text="整点刷新(5min)", variable=auto_refresh_var, command=lambda: schedule_next_refresh()).pack(side="left", padx=5)
+    ttk.Label(top_bar, textvariable=status_var, foreground="gray").pack(side="right", padx=5)
+    
+    def copy_details():
+        content = detail_text.get("1.0", "end-1c")
+        if content:
+            root.clipboard_clear()
+            root.clipboard_append(content)
+            messagebox.showinfo("提示", "已复制到剪贴板")
+
+    ttk.Button(top_bar, text="复制详情", command=copy_details).pack(side="left", padx=5)
+
+    detail_text = tk.Text(right_frame, wrap="none", font=("Consolas", 10))
+    ysb = ttk.Scrollbar(right_frame, orient="vertical", command=detail_text.yview)
+    ysb.pack(side="right", fill="y")
+    detail_text.pack(fill="both", expand=True)
+    detail_text.configure(yscrollcommand=ysb.set)
+
+    def save_current_watchlist():
+        items = list(watchlist.get(0, "end"))
+        # Clean up items to just codes if they have display info
+        clean_items = [x.split(" ")[0] for x in items]
+        save_watchlist(clean_items)
+
+    def get_all_symbols():
+        items = list(watchlist.get(0, "end"))
+        syms = [normalize_symbol(x.split(" ")[0]) for x in items]
+        return [s for s in syms if s]
+
+    def update_watchlist_display():
+        # Refresh display from latest snapshots
+        current_sel = watchlist.curselection()
+        selected_idx = current_sel[0] if current_sel else None
+        
+        items = list(watchlist.get(0, "end"))
+        new_items = []
+        for item in items:
+            raw = item.split(" ")[0]
+            sym = normalize_symbol(raw)
+            snap = latest_snapshot(sym)
+            if snap:
+                name = snap.get("name", "")
+                price = snap.get("price", 0.0)
+                prev = snap.get("prev_close", 0.0)
+                pct = (price - prev) / prev * 100 if prev > 0 else 0.0
+                display = f"{raw} {name} {price:.2f} {pct:+.2f}%"
+                new_items.append(display)
+            else:
+                new_items.append(raw)
+        
+        watchlist.delete(0, "end")
+        for it in new_items:
+            watchlist.insert("end", it)
+            
+        if selected_idx is not None and selected_idx < watchlist.size():
+            watchlist.selection_set(selected_idx)
+
+    def fetch_data(target_syms: List[str] = None):
+        if target_syms is None:
+            target_syms = get_all_symbols()
+        if not target_syms:
+            status_var.set("无股票代码")
             return
-        show_snapshot(sym, snap_list.currentRow())
 
-    def reload_history() -> None:
-        nonlocal records
-        with lock:
-            records = _load_jsonl_records(history_path)
-        refresh_symbol_list()
-        set_status(f"已重载历史 records={len(records)}")
-
-    class _Emitter(QtCore.QObject):
-        fetched = QtCore.Signal(list)
-        error = QtCore.Signal(str)
-        status = QtCore.Signal(str)
-
-    emitter = _Emitter()
-
-    busy = {"v": False}
-    current_codes = {"v": ""}
-
-    def after_fetch(got: List[str]) -> None:
-        busy["v"] = False
-        refresh_symbol_list()
-        set_status(f"已获取: {', '.join(got) if got else '无'}  records={len(records)}")
-        sym = current_symbol()
-        if sym:
-            refresh_snapshots(sym)
-
-    def after_error(msg: str) -> None:
-        busy["v"] = False
-        set_status(msg)
-
-    emitter.fetched.connect(after_fetch)
-    emitter.error.connect(after_error)
-    emitter.status.connect(set_status)
-
-    def do_fetch() -> None:
-        if busy["v"]:
-            return
-        codes_text = codes_edit.text().strip()
-        if not codes_text:
-            set_status("请输入股票代码")
-            return
-        busy["v"] = True
-        set_status("请求中...")
-        current_codes["v"] = codes_text
-
-        def worker() -> None:
+        status_var.set("正在刷新...")
+        root.update_idletasks()
+        
+        import threading
+        def run_thread():
             try:
-                def status_cb(msg: str) -> None:
-                    emitter.status.emit(msg)
-
-                got = fetch_and_store(codes_text, status_cb=status_cb)
-                emitter.fetched.emit(got)
+                # status callback update
+                def cb(msg):
+                    print(msg) 
+                res = fetch_and_store(target_syms, status_cb=cb)
+                root.after(0, lambda: on_fetch_done(res))
             except Exception as e:
-                emitter.error.emit(f"{type(e).__name__}: {e}".strip())
+                # Capture exception message immediately to avoid closure issues
+                err_msg = str(e)
+                root.after(0, lambda: on_fetch_error(err_msg))
+        
+        threading.Thread(target=run_thread, daemon=True).start()
 
-        threading.Thread(target=worker, daemon=True).start()
+    def on_fetch_done(res):
+        status_var.set(f"刷新成功 {datetime.now().strftime('%H:%M:%S')}")
+        update_watchlist_display()
+        refresh_detail()
 
-    def copy_latest() -> None:
-        sym = current_symbol()
-        if not sym:
-            set_status("请选择股票")
+    def on_fetch_error(msg):
+        status_var.set(f"刷新失败: {msg}")
+
+    def fetch_all(force=False):
+        fetch_data()
+
+    def refresh_detail():
+        sel = watchlist.curselection()
+        if not sel:
+            detail_text.delete("1.0", "end")
             return
-        r = latest_snapshot(sym)
-        if not r:
-            set_status("无可复制数据")
+        
+        item = watchlist.get(sel[0])
+        sym = normalize_symbol(item.split(" ")[0])
+        snap = latest_snapshot(sym)
+        
+        if not snap:
+            detail_text.delete("1.0", "end")
+            detail_text.insert("1.0", "暂无数据，请刷新")
             return
-        app.clipboard().setText(safe_json(r))
-        set_status("已复制到剪贴板")
+            
+        # Format snapshot as Human Readable
+        lines = []
+        
+        # 1. Basic Info
+        name = snap.get("name", "")
+        symbol = snap.get("symbol", "")
+        price = snap.get("price", 0.0)
+        prev = snap.get("prev_close", 0.0)
+        pct = (price - prev) / prev * 100 if prev > 0 else 0.0
+        
+        lines.append(f"=== 基础行情: {name} ({symbol}) ===")
+        lines.append(f"时间: {snap.get('date')} {snap.get('time')}")
+        lines.append(f"现价: {price:.2f} ({pct:+.2f}%)")
+        lines.append(f"昨收: {prev:.2f}")
+        lines.append(f"今开: {snap.get('open', 0.0):.2f}")
+        lines.append(f"最高: {snap.get('high', 0.0):.2f}")
+        lines.append(f"最低: {snap.get('low', 0.0):.2f}")
+        lines.append(f"成交量: {_fmt_num(snap.get('volume', 0))}")
+        lines.append(f"成交额: {_fmt_num(snap.get('amount', 0))}")
+        
+        orderbook = snap.get("orderbook", {})
+        if orderbook:
+             lines.append("")
+             lines.append("买盘:")
+             bids = orderbook.get("bids", [])
+             for p, v in bids[:5]: # Show top 5
+                 lines.append(f"  {p:.2f} : {_fmt_num(v)}")
+             lines.append("卖盘:")
+             asks = orderbook.get("asks", [])
+             for p, v in asks[:5]: # Show top 5
+                 lines.append(f"  {p:.2f} : {_fmt_num(v)}")
 
-    def copy_history() -> None:
-        sym = current_symbol()
-        if not sym:
-            set_status("请选择股票")
-            return
-        rs = records_for_symbol(sym)
-        if not rs:
-            set_status("无可复制数据")
-            return
-        app.clipboard().setText(safe_json(rs))
-        set_status("已复制到剪贴板")
+        lines.append("")
 
-    timer = QtCore.QTimer()
-    timer.setInterval(int(max(interval_s, 0.5) * 1000))
-    timer.timeout.connect(lambda: do_fetch() if auto_chk.isChecked() else None)
-    timer.start()
+        # 2. Real-time Indicators
+        lines.append("=== 实时指标 ===")
+        intra = snap.get("intraday_metrics", {})
+        lines.append(json.dumps(_json_safe(intra), ensure_ascii=False, indent=2))
+        lines.append("")
 
-    fetch_btn.clicked.connect(do_fetch)
-    reload_btn.clicked.connect(reload_history)
-    copy_latest_btn.clicked.connect(copy_latest)
-    copy_history_btn.clicked.connect(copy_history)
-    filter_edit.textChanged.connect(lambda _: refresh_symbol_list())
-    sym_list.currentRowChanged.connect(lambda _: on_symbol_changed())
-    snap_list.currentRowChanged.connect(lambda _: on_snapshot_changed())
+        # 3. 5-min K-line Indicators
+        lines.append("=== 5分钟K线指标 ===")
+        m5 = snap.get("m5_metrics", {})
+        lines.append(json.dumps(_json_safe(m5), ensure_ascii=False, indent=2))
+        lines.append("")
 
-    refresh_symbol_list()
-    if codes_edit.text().strip():
-        do_fetch()
+        # 5-min K-line Data (Today)
+        m5_bars = snap.get("m5_bars_today", [])
+        if m5_bars:
+            lines.append(f"今日5分钟K线（9:30至今 bars={len(m5_bars)}）：")
+            for b in m5_bars:
+                # b format: {t, o, h, l, c, v}
+                dt = b.get("t", "")
+                o = b.get("o", 0.0)
+                h = b.get("h", 0.0)
+                l = b.get("l", 0.0)
+                c = b.get("c", 0.0)
+                v = b.get("v", 0.0) / 10000.0 # Convert to Wan
+                lines.append(f"{dt}  O:{o:.3f} H:{h:.3f} L:{l:.3f} C:{c:.3f} V:{v:.2f}万")
+            lines.append("")
 
-    win.resize(1100, 700)
-    win.show()
-    return int(app.exec())
+        # Auction Data
+        auc_summary = snap.get("auction_summary", {})
+        if auc_summary:
+            lines.append(f"集合竞价（9:15-9:30）：")
+            lines.append(json.dumps(_json_safe(auc_summary), ensure_ascii=False, indent=2))
+            lines.append("")
+
+        # 4. Daily K-line Indicators
+        lines.append("=== 日K指标 ===")
+        daily = snap.get("daily_metrics", {})
+        lines.append(json.dumps(_json_safe(daily), ensure_ascii=False, indent=2))
+        
+        detail_text.delete("1.0", "end")
+        detail_text.insert("1.0", "\n".join(lines))
+
+    def on_select(event):
+        refresh_detail()
+
+    watchlist.bind("<<ListboxSelect>>", on_select)
+    
+    # Initial population
+    for c in watch_codes:
+        watchlist.insert("end", c)
+    
+    # Try to display existing data
+    update_watchlist_display()
+
+    def schedule_next_refresh():
+        if not auto_refresh_var.get(): return
+        now = datetime.now()
+        next_min = (now.minute // 5 + 1) * 5
+        delta_sec = (next_min - now.minute) * 60 - now.second
+        if delta_sec <= 0: delta_sec = 300
+        status_var.set(f"下次刷新将在 {delta_sec} 秒后")
+        root.after(delta_sec * 1000, do_auto_refresh)
+
+    def do_auto_refresh():
+        if auto_refresh_var.get():
+            fetch_all()
+            schedule_next_refresh()
+
+    if codes:
+        fetch_all()
+        
+    root.mainloop()
+    return 0
+
+
+
 
 
 def serve(
